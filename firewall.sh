@@ -33,10 +33,14 @@ backup_file() {
 
 detect_sshd_ports() {
   if command -v sshd >/dev/null 2>&1; then
-    sshd -T -f /etc/ssh/sshd_config 2>/dev/null | awk '/^port /{print $2}' | xargs || true
+    local ports
+    ports="$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | xargs || true)"
+    if [[ -n "$ports" ]]; then
+      echo "$ports"
+      return 0
+    fi
   fi
-  # fallback
-  [[ -n "${ports:-}" ]] && echo "$ports" || echo "22"
+  echo "22"
 }
 
 make_docker_user_block() {
