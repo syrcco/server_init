@@ -154,7 +154,7 @@ configure_ufw() {
   sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
 
   log "启用 ufw"
-  yes | ufw enable >/dev/null
+  ufw --force enable >/dev/null
 
   log "ufw 状态："
   ufw status verbose || true
