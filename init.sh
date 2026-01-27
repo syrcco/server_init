@@ -1,5 +1,3 @@
-( curl -fsSLo reinstall.sh https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh || wget -O reinstall.sh https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh ) && bash reinstall.sh debian 12 --ssh-port 31415 --ssh-key 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGE3rQl0o4KRV3UggBH7VlCmQDS8xT/eRUwBFKOyO/f/'
-
 NEW_USER="syrcco"
 
 # 解析命令行参数
@@ -123,7 +121,8 @@ echo "测试步骤："
 echo "1. 打开新终端"
 echo "3. 测试 sudo 权限: sudo whoami"
 echo ""
-read -p "确认新用户登录成功后，输入 yes 继续禁用 root 登录 [yes/no]: " confirm
+read -p "确认新用户登录成功后，输入 yes 继续禁用 root 登录 [yes/no]: " confirm < /dev/tty
+
 
 if [[ "$confirm" == "yes" ]]; then
     sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/g' /etc/ssh/sshd_config
