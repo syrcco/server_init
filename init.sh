@@ -99,6 +99,10 @@ docker compose version
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/g' /etc/ssh/sshd_config
 
 # === 创建普通用户 ===
+apt-get install -y sudo
+mkdir -p /etc/sudoers.d
+chmod 755 /etc/sudoers.d
+
 useradd -m -s /bin/bash "$NEW_USER"
 
 cat > /etc/sudoers.d/"$NEW_USER" <<EOF
