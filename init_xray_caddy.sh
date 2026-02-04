@@ -615,24 +615,6 @@ echo "---- Docker compose status ----"
 ( cd "${CADDY_DIR}" && COMPOSE_PROJECT_NAME="caddy" docker compose ps ) || true
 
 echo
-echo "---- Container health (if available) ----"
-if docker inspect xray >/dev/null 2>&1; then
-  echo -n "xray:  "
-  docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}}' xray || true
-  echo
-else
-  echo "xray:  not found"
-fi
-
-if docker inspect caddy >/dev/null 2>&1; then
-  echo -n "caddy: "
-  docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}no healthcheck{{end}}' caddy || true
-  echo
-else
-  echo "caddy: not found"
-fi
-
-echo
 echo "---- Listening ports (expected: 80/tcp, 443/tcp, ${SS_PORT}/tcp+udp) ----"
 if command -v ss >/dev/null 2>&1; then
   ss -lntup | grep -E ":(80|443|${SS_PORT})\b" || true
