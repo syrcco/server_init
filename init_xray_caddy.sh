@@ -195,11 +195,14 @@ else
   fi
 
   # REALITY keypair via xray image
-  out="$(docker run --rm "${XRAY_IMAGE}" x25519)"
-  REALITY_PRIVATE_KEY="$(echo "${out}" | grep -i "PrivateKey" | cut -d':' -f2 | tr -d ' \r')"
-  REALITY_PUBLIC_KEY="$(echo "${out}" | grep -Ei "PublicKey|Password" | cut -d':' -f2 | tr -d ' \r')"
+  out="$(docker run --rm "${XRAY_IMAGE}" x25519 2>&1)"
+  
+  REALITY_PRIVATE_KEY="$(echo "${out}" | grep -i "PrivateKey" | awk -F': ' '{print $2}' | tr -d ' \r\n ')"
+  REALITY_PUBLIC_KEY="$(echo "${out}" | grep -Ei "PublicKey|Password" | awk -F': ' '{print $2}' | tr -d ' \r\n ')"
+
   if [[ -z "${REALITY_PRIVATE_KEY}" || -z "${REALITY_PUBLIC_KEY}" ]]; then
     echo "ERROR: failed to generate REALITY keypair from image '${XRAY_IMAGE}'" >&2
+    echo "DEBUG OUTPUT:" >&2
     echo "${out}" >&2
     exit 1
   fi
