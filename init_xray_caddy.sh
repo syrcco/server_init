@@ -520,7 +520,7 @@ cat >> "${CADDYFILE}" <<'EOF'
     # 这里的 tls 必须与你的测试域名匹配
     tls internal 
 
-    handle_host temp.guuax.com {
+    handle host temp.guuax.com {
 		respond "proxy stack OK (temp.guuax.com handled via :8443)" 200
 	}
 
