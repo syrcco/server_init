@@ -520,9 +520,10 @@ cat >> "${CADDYFILE}" <<'EOF'
     # 这里的 tls 必须与你的测试域名匹配
     tls internal 
 
-    handle host temp.guuax.com {
-		respond "proxy stack OK (temp.guuax.com handled via :8443)" 200
-	}
+    @temp host temp.guuax.com
+    handle @temp {
+        respond "proxy stack OK (temp.guuax.com handled via :8443)" 200
+    }
 
     handle {
         abort
@@ -581,7 +582,7 @@ echo "[*] Building Caddy image (with caddy-l4)..."
 echo "[OK] Build complete"
 
 echo "[*] Validating Caddyfile..."
-( cd "${CADDY_DIR}" && COMPOSE_PROJECT_NAME="caddy" docker compose run --rm caddy validate --config /etc/caddy/Caddyfile ) >/dev/null
+( cd "${CADDY_DIR}" && COMPOSE_PROJECT_NAME="caddy" docker compose run --rm caddy caddy validate --config /etc/caddy/Caddyfile ) >/dev/null
 echo "[OK] Caddyfile validation passed"
 
 echo "[*] Starting Caddy..."
