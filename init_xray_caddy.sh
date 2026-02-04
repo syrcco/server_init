@@ -503,7 +503,7 @@ cat >> "${CADDYFILE}" <<'EOF'
       route {
         proxy {
           upstream caddy:8443
-          proxy_protocol v2
+          proxy_protocol
         }
       }
     }
