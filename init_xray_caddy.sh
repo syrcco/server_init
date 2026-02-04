@@ -473,7 +473,6 @@ cat > "${CADDYFILE}" <<EOF
   servers :8443 {
     listener_wrappers {
       proxy_protocol
-      tls
     }
   }
 
