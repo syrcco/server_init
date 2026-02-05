@@ -473,6 +473,7 @@ cat > "${CADDYFILE}" <<EOF
   servers :8443 {
     listener_wrappers {
       proxy_protocol
+      tls
     }
   }
 
@@ -514,21 +515,15 @@ cat >> "${CADDYFILE}" <<'EOF'
   redir https://{host}{uri} 308
 }
 
-# Placeholder HTTPS site (self-signed/internal CA for now; replace later)
-:8443 {
-    # 这里的 tls 必须与你的测试域名匹配
-    tls internal 
-
-    @temp host temp.guuax.com
-    handle @temp {
-        respond "proxy stack OK (temp.guuax.com handled via :8443)" 200
-    }
-
-    handle {
-        abort
-    }
+temp.guuax.com:8443 {
+  tls internal
+  respond "proxy stack OK (temp.guuax.com)" 200
 }
-EOF
+
+:8443 {
+  tls internal
+  abort
+}
 
 chmod 644 "${CADDYFILE}"
 echo "[OK] Wrote ${CADDYFILE}"
