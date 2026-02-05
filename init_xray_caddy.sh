@@ -524,6 +524,7 @@ temp.guuax.com:8443 {
   tls internal
   abort
 }
+EOF
 
 chmod 644 "${CADDYFILE}"
 echo "[OK] Wrote ${CADDYFILE}"
