@@ -5,12 +5,13 @@ set -euo pipefail
 #  VPS 一键初始化脚本（合并 init_my_server.sh + init.sh + firewall.sh）
 #
 #  用法：
-#    bash init_server.sh [--dd] [--user USERNAME] [--help]
+#    bash init_server.sh [--dd] [--user USERNAME] [--yes] [--help]
 #
 #  模式：
 #    --dd       只运行 DD 重装脚本（bin456789/reinstall）
 #    --user     指定新建的普通用户名（默认 syrcco）
-#    默认       依次执行：装包 → 调优 → Docker → SSH 加固 → 用户 → 防火墙 → 自动更新
+#    --yes / -y 跳过所有交互确认，用自动测试结果决策
+#    默认       依次执行：装包 → 调优 → Swap → Docker → SSH 加固 → 用户 → 防火墙 → 自动更新
 #
 #  所有配置项均可通过环境变量覆盖，见下方「配置区」。
 # =============================================================================
@@ -22,6 +23,9 @@ TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 
 # SSH
 SSH_PORTS="${SSH_PORTS:-}"                           # 留空则自动检测 sshd 端口
+
+# Swap（auto=自动计算，0=跳过，具体值如 2G=强制指定）
+SWAP_SIZE="${SWAP_SIZE:-auto}"
 
 # DD 重装参数
 DD_OS_1="${DD_OS_1:-debian}"
@@ -36,6 +40,7 @@ UFW_RESET="${UFW_RESET:-1}"                          # 1=清空 ufw 规则后重
 # ========================= 内部变量 =========================
 
 DD_ONLY=0
+AUTO_YES=0
 INIT_ARGS=()
 
 # ========================= 工具函数 =========================
@@ -59,8 +64,10 @@ fetch() {
   fi
 }
 
-has_tty() {
-  # 检测是否有可用的交互终端
+should_interact() {
+  # --yes 模式下永远不交互
+  [[ "${AUTO_YES}" -eq 1 ]] && return 1
+  # 否则看有没有 TTY
   [[ -t 0 ]] && return 0
   [[ -e /dev/tty ]] && return 0
   return 1
@@ -95,15 +102,17 @@ detect_sshd_ports() {
 usage() {
   cat <<'EOF'
 用法：
-  bash init_server.sh [--dd] [--user USERNAME] [--help]
+  bash init_server.sh [--dd] [--user USERNAME] [--yes] [--help]
 
 模式：
   --dd        只运行 DD 重装脚本（bin456789/reinstall）
   --user NAME 指定新建的普通用户名（默认 syrcco）
-  默认        依次执行：装包 → 调优 → Docker → SSH 加固 → 用户 → 防火墙 → 自动更新
+  --yes / -y  跳过所有交互确认，用自动测试结果决策
+  默认        依次执行：装包 → 调优 → Swap → Docker → SSH 加固 → 用户 → 防火墙 → 自动更新
 
 环境变量：
   SSH_PORTS              手动指定 SSH 端口（留空自动检测）
+  SWAP_SIZE              Swap 大小（auto=自动计算，0=跳过，如 2G=强制指定）
   EXTRA_INPUT_TCP_PORTS  额外开放的主机入站 TCP 端口（空格分隔）
   UFW_RESET              1=清空 ufw 规则后重建（默认）；0=仅追加
   DD_OS_1 / DD_OS_2      DD 重装的目标系统（默认 debian 12）
@@ -124,6 +133,10 @@ while [[ $# -gt 0 ]]; do
       [[ -n "${2:-}" ]] || die "--user 需要一个参数"
       NEW_USER="$2"
       shift 2
+      ;;
+    --yes|-y)
+      AUTO_YES=1
+      shift
       ;;
     -h|--help)
       usage
@@ -222,6 +235,9 @@ net.ipv4.conf.default.rp_filter = 1
 
 # --- IP 转发（Docker 需要） ---
 net.ipv4.ip_forward             = 1
+
+# --- Swap ---
+vm.swappiness                   = 10
 EOF
 
   # 禁用 IPv6（注意：某些软件依赖 IPv6 回环，如有问题请删除此文件）
@@ -235,7 +251,81 @@ EOF
   log "内核参数已生效"
 }
 
-# ---------- 4. Docker ----------
+# ---------- 4. Swap ----------
+setup_swap() {
+  if [[ "${SWAP_SIZE}" == "0" ]]; then
+    log "SWAP_SIZE=0，跳过 Swap 创建"
+    return 0
+  fi
+
+  # 如果已有活跃 swap，跳过
+  if [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then
+    log "已检测到活跃 Swap，跳过创建"
+    swapon --show
+    return 0
+  fi
+
+  # 计算大小
+  local swap_mb
+  if [[ "${SWAP_SIZE}" == "auto" ]]; then
+    # 获取根分区可用空间（MB）
+    local disk_avail_mb
+    disk_avail_mb="$(df -BM --output=avail / | tail -1 | tr -d ' M')"
+    if (( disk_avail_mb < 8192 )); then
+      swap_mb=1024
+    else
+      swap_mb=2048
+    fi
+    log "自动计算 Swap: 磁盘可用 ${disk_avail_mb}MB → Swap ${swap_mb}MB"
+  else
+    # 解析用户指定的大小（支持 1G/2G/512M 格式）
+    local size_upper
+    size_upper="$(echo "${SWAP_SIZE}" | tr '[:lower:]' '[:upper:]')"
+    if [[ "${size_upper}" =~ ^([0-9]+)G$ ]]; then
+      swap_mb=$(( ${BASH_REMATCH[1]} * 1024 ))
+    elif [[ "${size_upper}" =~ ^([0-9]+)M$ ]]; then
+      swap_mb=${BASH_REMATCH[1]}
+    elif [[ "${size_upper}" =~ ^([0-9]+)$ ]]; then
+      # 纯数字默认按 MB
+      swap_mb=${size_upper}
+    else
+      warn "无法解析 SWAP_SIZE=${SWAP_SIZE}，跳过 Swap 创建"
+      return 0
+    fi
+    log "使用指定 Swap 大小: ${swap_mb}MB"
+  fi
+
+  # 检查磁盘剩余空间是否足够（至少留 1GB 余量）
+  local disk_avail_mb
+  disk_avail_mb="$(df -BM --output=avail / | tail -1 | tr -d ' M')"
+  if (( disk_avail_mb < swap_mb + 1024 )); then
+    warn "磁盘可用空间不足（剩余 ${disk_avail_mb}MB，需要 swap ${swap_mb}MB + 1GB 余量），跳过 Swap 创建"
+    return 0
+  fi
+
+  # 创建 swap 文件
+  log "创建 Swap 文件: /swapfile (${swap_mb}MB)..."
+  if ! fallocate -l "${swap_mb}M" /swapfile 2>/dev/null; then
+    warn "fallocate 创建 /swapfile 失败（文件系统可能不支持），跳过 Swap 创建"
+    rm -f /swapfile
+    return 0
+  fi
+
+  chmod 600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  log "Swap 已激活"
+
+  # 写入 fstab（幂等）
+  if ! grep -q '/swapfile' /etc/fstab 2>/dev/null; then
+    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    log "已写入 /etc/fstab"
+  fi
+
+  swapon --show
+}
+
+# ---------- 5. Docker ----------
 install_docker() {
   log "配置 Docker daemon..."
   mkdir -p /etc/docker
@@ -263,7 +353,7 @@ EOF
   docker compose version || warn "docker compose plugin 未安装，如需使用请另行安装"
 }
 
-# ---------- 5. SSH 加固（仅修改配置，不重启） ----------
+# ---------- 6. SSH 加固（仅修改配置，不重启） ----------
 harden_ssh() {
   # 安全检查：只有 root 存在有效公钥时才禁用密码登录，防止锁死
   if [[ -s /root/.ssh/authorized_keys ]]; then
@@ -284,7 +374,7 @@ EOF
   fi
 }
 
-# ---------- 6. 创建普通用户（幂等） ----------
+# ---------- 7. 创建普通用户（幂等） ----------
 create_user() {
   log "创建用户: ${NEW_USER}"
 
@@ -315,57 +405,160 @@ EOF
   chown -R "${NEW_USER}:${NEW_USER}" "/home/${NEW_USER}/.ssh"
 }
 
-# ---------- 7. 交互确认禁用 root 登录 ----------
-confirm_disable_root() {
-  echo ""
-  echo "========================================="
-  echo "  重要：请在新终端测试 ${NEW_USER} 登录"
-  echo ""
-  echo "  测试步骤："
-  echo "  1. 打开新终端"
-  echo "  2. 用 ${NEW_USER} 用户 SSH 登录"
-  echo "  3. 测试 sudo 权限: sudo whoami"
-  echo "========================================="
-  echo ""
+# ---------- 8. 自动验证用户配置 ----------
+verify_user_setup() {
+  log "自动验证用户 ${NEW_USER} 配置..."
+  local failures=()
 
-  local hardening_conf="/etc/ssh/sshd_config.d/00-hardening.conf"
-
-  if has_tty; then
-    local confirm=""
-    read -rp "确认新用户登录成功后，输入 yes 继续禁用 root 登录 [yes/no]: " confirm < /dev/tty || true
-
-    if [[ "${confirm}" == "yes" ]]; then
-      # 追加 PermitRootLogin 到 sshd_config.d（如果 harden_ssh 已创建该文件则追加，否则新建）
-      mkdir -p /etc/ssh/sshd_config.d
-      if [[ -f "${hardening_conf}" ]]; then
-        if ! grep -q '^PermitRootLogin' "${hardening_conf}"; then
-          echo "PermitRootLogin no" >> "${hardening_conf}"
-        fi
-      else
-        echo "PermitRootLogin no" > "${hardening_conf}"
-      fi
-      log "Root SSH 登录已配置为禁用（重启 SSH 后生效）"
-    else
-      warn "Root SSH 登录未禁用！"
-      warn "建议测试成功后手动执行："
-      warn "  echo 'PermitRootLogin no' >> ${hardening_conf}"
-      warn "  systemctl restart ssh"
-    fi
+  # 检查 1: 用户可切入
+  if runuser -l "${NEW_USER}" -c 'id' >/dev/null 2>&1; then
+    log "  用户切入: 通过"
   else
-    warn "未检测到交互终端（TTY），跳过禁用 root 登录的交互确认"
-    warn "请稍后手动验证 ${NEW_USER} 可登录后，执行："
-    warn "  echo 'PermitRootLogin no' >> ${hardening_conf}"
-    warn "  systemctl restart ssh"
+    failures+=("用户 ${NEW_USER} 无法切入（runuser 失败）")
+    warn "  用户切入: 失败"
+  fi
+
+  # 检查 2: sudoers 语法正确
+  if visudo -cf "/etc/sudoers.d/${NEW_USER}" >/dev/null 2>&1; then
+    log "  sudoers 语法: 通过"
+  else
+    failures+=("sudoers 文件语法错误")
+    warn "  sudoers 语法: 失败"
+  fi
+
+  # 检查 3: NOPASSWD sudo 可用
+  if runuser -l "${NEW_USER}" -c 'sudo -n whoami' >/dev/null 2>&1; then
+    log "  sudo 权限: 通过"
+  else
+    failures+=("sudo -n whoami 失败（NOPASSWD 可能未生效）")
+    warn "  sudo 权限: 失败"
+  fi
+
+  # 检查 4: SSH 公钥格式有效
+  local ak="/home/${NEW_USER}/.ssh/authorized_keys"
+  if [[ -s "${ak}" ]] && ssh-keygen -l -f "${ak}" >/dev/null 2>&1; then
+    log "  SSH 公钥: 通过"
+  else
+    failures+=("authorized_keys 不存在、为空或公钥格式无效")
+    warn "  SSH 公钥: 失败"
+  fi
+
+  # 检查 5: sshd 配置语法
+  local sshd_bin=""
+  if command -v sshd >/dev/null 2>&1; then
+    sshd_bin="sshd"
+  elif [[ -x /usr/sbin/sshd ]]; then
+    sshd_bin="/usr/sbin/sshd"
+  fi
+  if [[ -n "${sshd_bin}" ]] && "${sshd_bin}" -t 2>/dev/null; then
+    log "  sshd 配置: 通过"
+  else
+    failures+=("sshd -t 配置检查失败")
+    warn "  sshd 配置: 失败"
+  fi
+
+  # 返回结果
+  if [[ ${#failures[@]} -eq 0 ]]; then
+    log "所有验证项通过"
+    return 0
+  else
+    warn "以下验证项未通过："
+    for f in "${failures[@]}"; do
+      warn "  - ${f}"
+    done
+    return 1
   fi
 }
 
-# ---------- 8. 统一重启 SSH（只调用一次） ----------
-restart_ssh() {
-  log "重启 SSH 服务..."
-  systemctl restart ssh
+# ---------- 9. 决策是否禁用 root 登录 ----------
+confirm_disable_root() {
+  local hardening_conf="/etc/ssh/sshd_config.d/00-hardening.conf"
+
+  # 先跑自动测试
+  local verify_ok=0
+  if verify_user_setup; then
+    verify_ok=1
+  fi
+
+  echo ""
+
+  # 内部函数：执行禁用 root 登录
+  _do_disable_root() {
+    mkdir -p /etc/ssh/sshd_config.d
+    if [[ -f "${hardening_conf}" ]]; then
+      if ! grep -q '^PermitRootLogin' "${hardening_conf}"; then
+        echo "PermitRootLogin no" >> "${hardening_conf}"
+      fi
+    else
+      echo "PermitRootLogin no" > "${hardening_conf}"
+    fi
+    log "Root SSH 登录已配置为禁用（重启 SSH 后生效）"
+  }
+
+  _print_manual_hint() {
+    warn "Root SSH 登录未禁用。建议手动验证后执行："
+    warn "  echo 'PermitRootLogin no' >> ${hardening_conf}"
+    warn "  systemctl restart ssh"
+  }
+
+  if should_interact; then
+    # 交互模式：展示测试结果后让用户确认
+    echo "========================================="
+    echo "  请在新终端测试 ${NEW_USER} 用户 SSH 登录"
+    echo "  测试步骤："
+    echo "  1. 打开新终端"
+    echo "  2. 用 ${NEW_USER} 用户 SSH 登录"
+    echo "  3. 测试 sudo 权限: sudo whoami"
+    echo "========================================="
+    echo ""
+    local confirm=""
+    read -rp "确认新用户登录成功后，输入 yes 继续禁用 root 登录 [yes/no]: " confirm < /dev/tty || true
+    if [[ "${confirm}" == "yes" ]]; then
+      _do_disable_root
+    else
+      _print_manual_hint
+    fi
+  else
+    # 非交互模式（--yes 或无 TTY）：用自动测试结果决策
+    if [[ "${verify_ok}" -eq 1 ]]; then
+      log "自动测试全部通过，自动禁用 root SSH 登录"
+      _do_disable_root
+    else
+      warn "自动测试未全部通过，保留 root SSH 登录"
+      _print_manual_hint
+    fi
+  fi
 }
 
-# ---------- 9. 防火墙（UFW） ----------
+# ---------- 10. 统一重启 SSH（sshd -t 安全门） ----------
+restart_ssh() {
+  local hardening_conf="/etc/ssh/sshd_config.d/00-hardening.conf"
+
+  # sshd -t 安全门：配置有误则回滚并拒绝重启
+  local sshd_bin=""
+  if command -v sshd >/dev/null 2>&1; then
+    sshd_bin="sshd"
+  elif [[ -x /usr/sbin/sshd ]]; then
+    sshd_bin="/usr/sbin/sshd"
+  fi
+
+  if [[ -n "${sshd_bin}" ]]; then
+    if "${sshd_bin}" -t 2>/dev/null; then
+      log "sshd -t 配置检查通过，重启 SSH..."
+      systemctl restart ssh
+    else
+      warn "sshd -t 配置检查失败！回滚 SSH 加固配置，不重启 SSH"
+      rm -f "${hardening_conf}"
+      warn "已删除 ${hardening_conf}，SSH 配置恢复为修改前状态"
+      warn "请手动检查 SSH 配置后再操作"
+    fi
+  else
+    warn "未找到 sshd 二进制文件，无法做配置检查，尝试直接重启..."
+    systemctl restart ssh
+  fi
+}
+
+# ---------- 11. 防火墙（UFW） ----------
 setup_firewall() {
   log "安装 UFW..."
   apt-get install -y ufw
@@ -427,7 +620,7 @@ setup_firewall() {
   ufw status verbose || true
 }
 
-# ---------- 10. 自动安全更新 ----------
+# ---------- 12. 自动安全更新 ----------
 setup_auto_update() {
   log "配置自动安全更新（unattended-upgrades）..."
   export DEBIAN_FRONTEND=noninteractive
@@ -460,7 +653,7 @@ EOF
   unattended-upgrade --dry-run --debug || true
 }
 
-# ---------- 11. 最终状态汇总 ----------
+# ---------- 13. 最终状态汇总 ----------
 final_check() {
   echo ""
   echo "========================================="
@@ -472,11 +665,20 @@ final_check() {
   sysctl net.ipv4.ip_forward \
          net.ipv4.tcp_congestion_control \
          net.core.default_qdisc \
+         vm.swappiness \
          2>/dev/null || true
 
   echo ""
   echo "--- 时间 ---"
   timedatectl 2>/dev/null | grep -E "Time zone|Local time" || true
+
+  echo ""
+  echo "--- Swap ---"
+  if [[ -n "$(swapon --show --noheadings 2>/dev/null)" ]]; then
+    swapon --show
+  else
+    warn "无活跃 Swap"
+  fi
 
   echo ""
   echo "--- Docker ---"
@@ -520,6 +722,7 @@ main() {
   install_packages
   configure_time
   configure_sysctl
+  setup_swap
   install_docker
   harden_ssh
   create_user
