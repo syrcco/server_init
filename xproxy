@@ -1,0 +1,1302 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ═══════ 可配置项 ═══════
+DOMAIN="kaemito.com"
+SS_PORT=59876
+REALITY_PORT=44443
+CADDY_HTTPS_PORT=8443
+
+CADDY_IMAGE="ghcr.io/syrcco/caddy-l4:latest"
+XRAY_IMAGE="ghcr.io/xtls/xray-core:latest"
+SITE_IMAGE="ghcr.io/syrcco/login_site:latest"
+
+DIR_CADDY="/opt/caddy-l4"
+DIR_XRAY="/opt/xray"
+DIR_SITE="/opt/fake-site"
+DOCKER_NETWORK="proxy"
+# ═══════════════════════
+
+CONF_BASE="$DIR_XRAY/conf/00-base.json"
+CONF_CUSTOM="$DIR_XRAY/conf/10-custom.json"
+META_FILE="$DIR_XRAY/.meta.json"
+
+# ── 颜色 ──
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}✓${NC} $*"; }
+warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
+error() { echo -e "${RED}✗${NC} $*"; }
+title() { echo -e "\n${BOLD}${CYAN}── $* ──${NC}\n"; }
+
+press_enter() {
+    echo ""
+    read -rp "按回车返回..."
+}
+
+# ── 前置检查 ──
+check_root() {
+    [[ $EUID -eq 0 ]] || { error "请以 root 身份运行"; exit 1; }
+}
+
+check_docker() {
+    command -v docker &>/dev/null || { error "未安装 Docker"; exit 1; }
+    docker compose version &>/dev/null || { error "未安装 docker compose 插件"; exit 1; }
+}
+
+check_deps() {
+    for cmd in openssl base64; do
+        command -v "$cmd" &>/dev/null || { error "缺少依赖: $cmd"; exit 1; }
+    done
+}
+
+check_jq() {
+    if ! command -v jq &>/dev/null; then
+        warn "jq 未安装，正在安装..."
+        if command -v apt-get &>/dev/null; then
+            apt-get update -qq && apt-get install -y -qq jq >/dev/null 2>&1
+        elif command -v yum &>/dev/null; then
+            yum install -y jq >/dev/null 2>&1
+        elif command -v apk &>/dev/null; then
+            apk add --quiet jq >/dev/null 2>&1
+        else
+            error "无法自动安装 jq，请手动安装后重试"; exit 1
+        fi
+        command -v jq &>/dev/null || { error "jq 安装失败"; exit 1; }
+        info "jq 已安装"
+    fi
+}
+
+is_installed() {
+    [[ -f "$CONF_BASE" && -f "$META_FILE" ]]
+}
+
+ensure_installed() {
+    is_installed || { error "尚未安装，请先执行安装部署"; press_enter; return 1; }
+}
+
+# ── 元数据读取 ──
+meta_get() {
+    jq -r ".$1" "$META_FILE"
+}
+
+get_node() {
+    meta_get "node"
+}
+
+get_fqdn() {
+    echo "$(get_node).$DOMAIN"
+}
+
+get_public_key() {
+    meta_get "reality_public_key"
+}
+
+get_short_id() {
+    meta_get "short_id"
+}
+
+# ── jq 辅助 ──
+update_base() {
+    local filter="$1"
+    shift
+    local tmp
+    tmp=$(mktemp)
+    if jq "$@" "$filter" "$CONF_BASE" > "$tmp"; then
+        mv "$tmp" "$CONF_BASE"
+        chmod 600 "$CONF_BASE"
+    else
+        rm -f "$tmp"
+        error "JSON 操作失败"
+        return 1
+    fi
+}
+
+restart_xray() {
+    if cd "$DIR_XRAY" && docker compose restart xray >/dev/null 2>&1; then
+        info "xray 已重启"
+    else
+        error "xray 重启失败，请检查 docker logs xray"
+    fi
+}
+
+# ── 密钥生成 ──
+gen_short_id() {
+    openssl rand -hex 8
+}
+
+gen_ss_key() {
+    openssl rand -base64 32
+}
+
+# ── base64url 编码 ──
+base64url_encode() {
+    printf '%s' "$1" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '='
+}
+
+# ── 分享链接生成 ──
+gen_vless_link() {
+    local uuid="$1" email="$2"
+    local node fqdn pbk sid label
+    node=$(get_node)
+    fqdn=$(get_fqdn)
+    pbk=$(get_public_key)
+    sid=$(get_short_id)
+    label=$(echo "${node}-${email}" | tr '[:lower:]' '[:upper:]')
+    echo "vless://${uuid}@${fqdn}:443?type=tcp&security=reality&sni=${fqdn}&fp=chrome&pbk=${pbk}&sid=${sid}&flow=xtls-rprx-vision#${label}"
+}
+
+gen_ss_link() {
+    local user_key="$1" email="$2"
+    local node fqdn server_key method userinfo
+    node=$(get_node)
+    fqdn=$(get_fqdn)
+    server_key=$(jq -r '(.inbounds[] | select(.tag=="ss2022")).settings.password' "$CONF_BASE")
+    method="2022-blake3-aes-256-gcm"
+    userinfo=$(base64url_encode "${method}:${server_key}:${user_key}")
+    local label
+    label=$(echo "${node}-${email}" | tr '[:lower:]' '[:upper:]')
+    echo "ss://${userinfo}@${fqdn}:${SS_PORT}#${label}"
+}
+
+# ── outbound 是否存在 ──
+outbound_exists() {
+    local tag="$1"
+    local found=false
+    if jq -e --arg t "$tag" '[.outbounds // [] | .[] | .tag] | index($t) != null' "$CONF_BASE" >/dev/null 2>&1; then
+        found=true
+    fi
+    if [[ "$found" == "false" ]] && [[ -f "$CONF_CUSTOM" ]]; then
+        if jq -e --arg t "$tag" '[.outbounds // [] | .[] | .tag] | index($t) != null' "$CONF_CUSTOM" >/dev/null 2>&1; then
+            found=true
+        fi
+    fi
+    [[ "$found" == "true" ]]
+}
+
+# ═══════════════════════════════════════════════════
+#  安装部署
+# ═══════════════════════════════════════════════════
+do_install() {
+    title "安装部署"
+
+    # 前置检查
+    check_deps
+    check_docker
+    check_jq
+
+    if is_installed; then
+        warn "已检测到现有安装 ($DIR_XRAY)"
+        echo "如需重装，请先卸载。"
+        press_enter
+        return
+    fi
+
+    # 检查容器名冲突
+    local conflicts=()
+    for name in caddy xray fake-site; do
+        if docker ps -a --format '{{.Names}}' | grep -qw "$name"; then
+            conflicts+=("$name")
+        fi
+    done
+    if [[ ${#conflicts[@]} -gt 0 ]]; then
+        error "以下容器名已被占用: ${conflicts[*]}"
+        echo "请先移除这些容器后再安装。"
+        press_enter
+        return
+    fi
+
+    # 交互提问
+    local node cf_token
+    read -rp "域名前缀 (如 hk1, us1): " node
+    node=$(echo "$node" | tr '[:upper:]' '[:lower:]')
+    if [[ -z "$node" ]]; then
+        error "域名前缀不能为空"
+        press_enter
+        return
+    fi
+    if ! [[ "$node" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+        error "域名前缀只能包含小写字母、数字和连字符，且不能以连字符开头或结尾"
+        press_enter
+        return
+    fi
+
+    echo ""
+    echo "Cloudflare API Token（用于 DNS-01 验证自动签证书）"
+    echo "如果跳过，Caddy 将使用 HTTP-01 自动验证（需要 DNS A 记录已指向本机）"
+    read -rp "CF API Token (回车跳过): " cf_token
+
+    local fqdn="${node}.${DOMAIN}"
+    echo ""
+    echo -e "  节点域名: ${BOLD}${fqdn}${NC}"
+    echo -e "  证书验证: ${BOLD}$([ -n "$cf_token" ] && echo "DNS-01 (Cloudflare)" || echo "HTTP-01 (自动)")${NC}"
+    echo ""
+    read -rp "确认开始安装？[Y/n]: " confirm
+    [[ "$confirm" =~ ^[nN] ]] && return
+
+    echo ""
+
+    # [3] 创建 Docker 网络
+    if ! docker network inspect "$DOCKER_NETWORK" &>/dev/null; then
+        docker network create "$DOCKER_NETWORK" >/dev/null
+        info "Docker 网络 $DOCKER_NETWORK 已创建"
+    else
+        info "Docker 网络 $DOCKER_NETWORK 已存在"
+    fi
+
+    # [4] 部署 fake-site
+    echo ""
+    echo -e "${BOLD}部署 fake-site ...${NC}"
+    mkdir -p "$DIR_SITE"
+    cat > "$DIR_SITE/docker-compose.yml" <<YAML
+services:
+  fake-site:
+    image: ${SITE_IMAGE}
+    container_name: fake-site
+    restart: unless-stopped
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
+YAML
+    cd "$DIR_SITE"
+    docker compose pull -q
+    docker compose up -d
+    info "fake-site 已部署"
+
+    # [5] 部署 caddy-l4
+    echo ""
+    echo -e "${BOLD}部署 caddy-l4 ...${NC}"
+    mkdir -p "$DIR_CADDY"
+
+    # Caddyfile + compose（按是否有 CF Token 分两套）
+    if [[ -n "$cf_token" ]]; then
+        cat > "$DIR_CADDY/docker-compose.yml" <<YAML
+services:
+  caddy:
+    image: ${CADDY_IMAGE}
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    env_file:
+      - .env
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
+
+volumes:
+  caddy_data:
+YAML
+        cat > "$DIR_CADDY/Caddyfile" <<EOF
+{
+    layer4 {
+        :443 {
+            @xray tls sni ${fqdn}
+            route @xray {
+                proxy xray:${REALITY_PORT}
+            }
+            route {
+                proxy 127.0.0.1:${CADDY_HTTPS_PORT}
+            }
+        }
+    }
+}
+
+${fqdn}:${CADDY_HTTPS_PORT} {
+    tls {
+        dns cloudflare {env.CF_API_TOKEN}
+    }
+    reverse_proxy fake-site:80
+}
+
+:80 {
+    redir https://{host}{uri} permanent
+}
+EOF
+        echo "CF_API_TOKEN=${cf_token}" > "$DIR_CADDY/.env"
+        chmod 600 "$DIR_CADDY/.env"
+    else
+        cat > "$DIR_CADDY/docker-compose.yml" <<YAML
+services:
+  caddy:
+    image: ${CADDY_IMAGE}
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
+
+volumes:
+  caddy_data:
+YAML
+        cat > "$DIR_CADDY/Caddyfile" <<EOF
+{
+    layer4 {
+        :443 {
+            @xray tls sni ${fqdn}
+            route @xray {
+                proxy xray:${REALITY_PORT}
+            }
+            route {
+                proxy 127.0.0.1:${CADDY_HTTPS_PORT}
+            }
+        }
+    }
+}
+
+${fqdn}:${CADDY_HTTPS_PORT} {
+    reverse_proxy fake-site:80
+}
+
+:80 {
+    redir https://{host}{uri} permanent
+}
+EOF
+    fi
+
+    cd "$DIR_CADDY"
+    docker compose pull -q
+    docker compose up -d
+    info "caddy-l4 已部署"
+
+    # [6] 部署 xray
+    echo ""
+    echo -e "${BOLD}部署 xray ...${NC}"
+    mkdir -p "$DIR_XRAY/conf"
+
+    # 拉取镜像
+    docker pull -q "$XRAY_IMAGE"
+
+    # 生成密钥
+    echo "  生成密钥..."
+    local x25519_output priv_key pub_key short_id smart_uuid ss_server_key ss_smart_key
+    x25519_output=$(docker run --rm "$XRAY_IMAGE" x25519)
+    priv_key=$(echo "$x25519_output" | grep "Private key:" | awk '{print $3}')
+    pub_key=$(echo "$x25519_output" | grep "Public key:" | awk '{print $3}')
+    if [[ -z "$priv_key" || -z "$pub_key" ]]; then
+        error "无法解析 x25519 密钥（xray 输出格式可能已变更）"
+        echo "原始输出: $x25519_output"
+        press_enter
+        return
+    fi
+    short_id=$(gen_short_id)
+    smart_uuid=$(docker run --rm "$XRAY_IMAGE" uuid)
+    if [[ -z "$smart_uuid" ]]; then
+        error "无法生成 UUID（xray 输出格式可能已变更）"
+        press_enter
+        return
+    fi
+    ss_server_key=$(gen_ss_key)
+    ss_smart_key=$(gen_ss_key)
+
+    # docker-compose.yml
+    cat > "$DIR_XRAY/docker-compose.yml" <<YAML
+services:
+  xray:
+    image: ${XRAY_IMAGE}
+    container_name: xray
+    restart: unless-stopped
+    user: "0:0"
+    command: ["run", "-confdir", "/etc/xray/"]
+    ports:
+      - "${SS_PORT}:${SS_PORT}"
+      - "${SS_PORT}:${SS_PORT}/udp"
+    volumes:
+      - ./conf/:/etc/xray/:ro
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
+YAML
+
+    # 00-base.json
+    local caddy_dest="caddy:${CADDY_HTTPS_PORT}"
+    jq -n \
+      --arg priv "$priv_key" \
+      --arg fqdn "$fqdn" \
+      --arg sid "$short_id" \
+      --arg uuid "$smart_uuid" \
+      --arg ss_srv "$ss_server_key" \
+      --arg ss_usr "$ss_smart_key" \
+      --arg dest "$caddy_dest" \
+      --argjson rport "$REALITY_PORT" \
+      --argjson sport "$SS_PORT" \
+      '{
+        "log": { "loglevel": "warning" },
+        "inbounds": [
+          {
+            "tag": "vless-reality",
+            "listen": "0.0.0.0",
+            "port": $rport,
+            "protocol": "vless",
+            "settings": {
+              "clients": [
+                { "id": $uuid, "flow": "xtls-rprx-vision", "email": "smart" }
+              ],
+              "decryption": "none"
+            },
+            "streamSettings": {
+              "network": "tcp",
+              "security": "reality",
+              "realitySettings": {
+                "dest": $dest,
+                "serverNames": [$fqdn],
+                "privateKey": $priv,
+                "shortIds": [$sid]
+              }
+            },
+            "sniffing": {
+              "enabled": true,
+              "destOverride": ["http", "tls", "quic"]
+            }
+          },
+          {
+            "tag": "ss2022",
+            "listen": "0.0.0.0",
+            "port": $sport,
+            "protocol": "shadowsocks",
+            "settings": {
+              "method": "2022-blake3-aes-256-gcm",
+              "password": $ss_srv,
+              "clients": [
+                { "password": $ss_usr, "email": "ss-smart" }
+              ],
+              "network": "tcp,udp"
+            }
+          }
+        ],
+        "outbounds": [
+          { "tag": "direct", "protocol": "freedom" }
+        ],
+        "routing": {
+          "domainStrategy": "AsIs",
+          "rules": []
+        }
+      }' > "$CONF_BASE"
+
+    # 10-custom.json
+    echo '{}' > "$CONF_CUSTOM"
+
+    # .meta.json
+    jq -n \
+      --arg node "$node" \
+      --arg domain "$DOMAIN" \
+      --arg pbk "$pub_key" \
+      --arg sid "$short_id" \
+      --argjson sport "$SS_PORT" \
+      '{
+        "node": $node,
+        "domain": $domain,
+        "reality_public_key": $pbk,
+        "short_id": $sid,
+        "ss_port": $sport,
+        "installed_at": (now | todate)
+      }' > "$META_FILE"
+
+    # 加固文件权限（含私钥和密码）
+    chmod 600 "$CONF_BASE" "$META_FILE"
+    chmod 700 "$DIR_XRAY/conf"
+
+    cd "$DIR_XRAY"
+    docker compose up -d
+    info "xray 已部署"
+
+    # [7] 验证
+    echo ""
+    echo "等待容器启动..."
+    sleep 3
+    local all_ok=true
+    for name in caddy xray fake-site; do
+        if docker ps --format '{{.Names}}' | grep -qw "$name"; then
+            info "$name 运行中"
+        else
+            error "$name 未运行！"
+            all_ok=false
+        fi
+    done
+
+    # [8] 输出结果
+    echo ""
+    echo -e "${BOLD}${GREEN}════════ 安装完成 ════════${NC}"
+    echo ""
+    echo -e "${BOLD}=== VLESS+REALITY ===${NC}"
+    echo -e "${CYAN}[smart]${NC}"
+    gen_vless_link "$smart_uuid" "smart"
+    echo ""
+    echo -e "${BOLD}=== SS2022 ===${NC}"
+    echo -e "${CYAN}[ss-smart]${NC}"
+    gen_ss_link "$ss_smart_key" "ss-smart"
+    echo ""
+    echo -e "${YELLOW}提示: 编辑 /opt/xray/conf/10-custom.json 配置 smart 节点路由规则${NC}"
+    if [[ "$all_ok" == "false" ]]; then
+        echo ""
+        warn "部分容器未正常启动，请检查 docker logs"
+    fi
+    press_enter
+}
+
+# ═══════════════════════════════════════════════════
+#  出站管理
+# ═══════════════════════════════════════════════════
+list_outbounds() {
+    jq -r '.outbounds[] | "\(.tag)\t\(.protocol)\t\(if .settings.servers then (.settings.servers[0] | "\(.address):\(.port)") else "-" end)"' "$CONF_BASE" 2>/dev/null
+}
+
+show_outbound_menu() {
+    ensure_installed || return
+
+    while true; do
+        title "出站管理"
+
+        echo "当前出站:"
+        local i=1
+        while IFS=$'\t' read -r tag proto dest; do
+            printf "  [%d] %-14s (%s" "$i" "$tag" "$proto"
+            [[ "$dest" != "-" ]] && printf " → %s" "$dest"
+            echo ")"
+            ((i++))
+        done < <(list_outbounds)
+
+        echo ""
+        echo "操作:"
+        echo "  a) 添加出站"
+        echo "  d) 删除出站"
+        echo "  0) 返回主菜单"
+        echo ""
+        read -rp "请选择: " choice
+
+        case "$choice" in
+            a) add_outbound ;;
+            d) delete_outbound ;;
+            0) return ;;
+            *) warn "无效选项" ;;
+        esac
+    done
+}
+
+add_outbound() {
+    title "添加出站"
+
+    echo "出站类型:"
+    echo "  1) direct (自由出站)"
+    echo "  2) shadowsocks (链式转发到落地服务器)"
+    echo ""
+    read -rp "请选择 [1-2]: " otype
+
+    local tag
+    read -rp "Tag 名称 (如 chain-us): " tag
+    if [[ -z "$tag" ]]; then
+        error "Tag 不能为空"
+        press_enter
+        return
+    fi
+
+    if outbound_exists "$tag"; then
+        error "出站 $tag 已存在"
+        press_enter
+        return
+    fi
+
+    case "$otype" in
+        1)
+            update_base '.outbounds += [{"tag":$tag,"protocol":"freedom"}]' --arg tag "$tag"
+            info "出站 $tag (direct) 已添加"
+            ;;
+        2)
+            local addr port method key
+            read -rp "落地服务器 IP: " addr
+            read -rp "端口 [8388]: " port
+            port=${port:-8388}
+            if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+                error "端口必须是 1-65535 的数字"
+                press_enter
+                return
+            fi
+            read -rp "加密方式 [2022-blake3-aes-256-gcm]: " method
+            method=${method:-2022-blake3-aes-256-gcm}
+            read -rp "密钥: " key
+            if [[ -z "$addr" || -z "$key" ]]; then
+                error "IP 和密钥不能为空"
+                press_enter
+                return
+            fi
+
+            local ob_json
+            ob_json=$(jq -n \
+                --arg tag "$tag" \
+                --arg addr "$addr" \
+                --argjson port "$port" \
+                --arg method "$method" \
+                --arg key "$key" \
+                '{
+                    "tag": $tag,
+                    "protocol": "shadowsocks",
+                    "settings": {
+                        "servers": [{
+                            "address": $addr,
+                            "port": $port,
+                            "method": $method,
+                            "password": $key
+                        }]
+                    }
+                }')
+            update_base '.outbounds += [$ob]' --argjson ob "$ob_json"
+            info "出站 $tag (shadowsocks → ${addr}:${port}) 已添加"
+            ;;
+        *)
+            warn "无效选项"
+            return
+            ;;
+    esac
+
+    restart_xray
+    press_enter
+}
+
+delete_outbound() {
+    title "删除出站"
+
+    # 列出可删除的出站（排除 direct）
+    local tags=()
+    while IFS=$'\t' read -r tag proto dest; do
+        [[ "$tag" == "direct" ]] && continue
+        tags+=("$tag")
+    done < <(list_outbounds)
+
+    if [[ ${#tags[@]} -eq 0 ]]; then
+        echo "  (没有可删除的出站，direct 不可删除)"
+        press_enter
+        return
+    fi
+
+    echo "可删除的出站:"
+    local i=1
+    for tag in "${tags[@]}"; do
+        local proto dest
+        proto=$(jq -r --arg t "$tag" '.outbounds[] | select(.tag==$t) | .protocol' "$CONF_BASE")
+        dest=$(jq -r --arg t "$tag" '.outbounds[] | select(.tag==$t) | if .settings.servers then (.settings.servers[0] | "\(.address):\(.port)") else "-" end' "$CONF_BASE")
+        printf "  [%d] %-14s (%s" "$i" "$tag" "$proto"
+        [[ "$dest" != "-" ]] && printf " → %s" "$dest"
+        echo ")"
+        ((i++))
+    done
+    echo "  (direct 不可删除)"
+    echo ""
+    read -rp "选择要删除的编号: " idx
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#tags[@]} )); then
+        warn "无效编号"
+        press_enter
+        return
+    fi
+
+    local del_tag="${tags[$((idx-1))]}"
+
+    # 检查引用
+    local refs
+    refs=$(jq -r --arg tag "$del_tag" '.routing.rules[] | select(.outboundTag==$tag) | .user[]' "$CONF_BASE" 2>/dev/null || true)
+
+    if [[ -n "$refs" ]]; then
+        echo ""
+        warn "以下节点正在使用此出站:"
+        echo "$refs" | while read -r email; do
+            echo "  - $email"
+        done
+        echo ""
+        read -rp "删除出站将同时删除这些节点及路由规则。继续？[y/N]: " confirm
+        [[ "$confirm" =~ ^[yY] ]] || return
+
+        # 删除引用该 outbound 的所有 clients 和 routing rules
+        while read -r email; do
+            # 查实际 inbound 归属，不靠前缀猜
+            if jq -e --arg e "$email" '(.inbounds[] | select(.tag=="vless-reality")).settings.clients[] | select(.email==$e)' "$CONF_BASE" >/dev/null 2>&1; then
+                update_base '(.inbounds[] | select(.tag=="vless-reality")).settings.clients |= map(select(.email != $email))' --arg email "$email"
+            fi
+            if jq -e --arg e "$email" '(.inbounds[] | select(.tag=="ss2022")).settings.clients[] | select(.email==$e)' "$CONF_BASE" >/dev/null 2>&1; then
+                update_base '(.inbounds[] | select(.tag=="ss2022")).settings.clients |= map(select(.email != $email))' --arg email "$email"
+            fi
+        done <<< "$refs"
+
+        # 删除引用的 routing rules
+        update_base '.routing.rules |= map(select(.outboundTag != $tag))' --arg tag "$del_tag"
+    fi
+
+    # 删除 outbound 自身
+    update_base '.outbounds |= map(select(.tag != $tag))' --arg tag "$del_tag"
+    info "出站 $del_tag 已删除"
+    restart_xray
+    press_enter
+}
+
+# ═══════════════════════════════════════════════════
+#  VLESS 节点管理
+# ═══════════════════════════════════════════════════
+list_vless_clients() {
+    jq -r '(.inbounds[] | select(.tag=="vless-reality")).settings.clients[] | .email' "$CONF_BASE" 2>/dev/null
+}
+
+get_vless_outbound() {
+    local email="$1"
+    # smart 节点 → 查 10-custom.json
+    if [[ "$email" == "smart" ]]; then
+        echo "(smart路由，编辑 10-custom.json)"
+        return
+    fi
+    local out
+    out=$(jq -r --arg email "$email" '.routing.rules[] | select(.user and (.user | index($email))) | .outboundTag' "$CONF_BASE" 2>/dev/null || true)
+    if [[ -z "$out" ]]; then
+        echo "direct (默认)"
+    else
+        echo "$out"
+    fi
+}
+
+show_vless_menu() {
+    ensure_installed || return
+
+    while true; do
+        title "VLESS 节点管理"
+
+        echo "当前节点:"
+        local i=1
+        while read -r email; do
+            local out
+            out=$(get_vless_outbound "$email")
+            if [[ "$email" == "smart" ]]; then
+                printf "  [%d] %-12s → %s    ← 不可删除\n" "$i" "$email" "$out"
+            else
+                printf "  [%d] %-12s → %s\n" "$i" "$email" "$out"
+            fi
+            ((i++))
+        done < <(list_vless_clients)
+
+        echo ""
+        echo "操作:"
+        echo "  a) 添加节点"
+        echo "  d) 删除节点"
+        echo "  0) 返回主菜单"
+        echo ""
+        read -rp "请选择: " choice
+
+        case "$choice" in
+            a) add_vless ;;
+            d) delete_vless ;;
+            0) return ;;
+            *) warn "无效选项" ;;
+        esac
+    done
+}
+
+add_vless() {
+    title "添加 VLESS 节点"
+
+    local name
+    read -rp "节点名称 (如 us, jp, netflix): " name
+    name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    if [[ -z "$name" ]]; then
+        error "名称不能为空"
+        press_enter
+        return
+    fi
+
+    # 检查是否已存在
+    if jq -e --arg email "$name" '(.inbounds[] | select(.tag=="vless-reality")).settings.clients[] | select(.email==$email)' "$CONF_BASE" >/dev/null 2>&1; then
+        error "节点 $name 已存在"
+        press_enter
+        return
+    fi
+
+    # 选择出站
+    echo ""
+    echo "可用出站:"
+    local out_tags=()
+    local j=1
+    while IFS=$'\t' read -r tag proto dest; do
+        out_tags+=("$tag")
+        printf "  [%d] %s" "$j" "$tag"
+        [[ "$dest" != "-" ]] && printf " (%s → %s)" "$proto" "$dest"
+        echo ""
+        ((j++))
+    done < <(list_outbounds)
+    echo ""
+    read -rp "选择出站 [1-${#out_tags[@]}]: " oidx
+    if ! [[ "$oidx" =~ ^[0-9]+$ ]] || (( oidx < 1 || oidx > ${#out_tags[@]} )); then
+        warn "无效编号"
+        press_enter
+        return
+    fi
+    local out_tag="${out_tags[$((oidx-1))]}"
+
+    # 生成 UUID
+    local uuid
+    uuid=$(docker run --rm "$XRAY_IMAGE" uuid)
+
+    # 添加 client
+    update_base '(.inbounds[] | select(.tag=="vless-reality")).settings.clients += [{"id":$id,"flow":"xtls-rprx-vision","email":$email}]' \
+        --arg id "$uuid" --arg email "$name"
+
+    # 添加 routing rule（如果不是 direct）
+    if [[ "$out_tag" != "direct" ]]; then
+        update_base '.routing.rules += [{"type":"field","user":[$user],"outboundTag":$out}]' \
+            --arg user "$name" --arg out "$out_tag"
+    fi
+
+    restart_xray
+
+    echo ""
+    info "VLESS 节点 $name 已添加 (出站: $out_tag)"
+    echo ""
+    echo -e "${BOLD}UUID:${NC} $uuid"
+    echo -e "${BOLD}分享链接:${NC}"
+    gen_vless_link "$uuid" "$name"
+    press_enter
+}
+
+delete_vless() {
+    title "删除 VLESS 节点"
+
+    local emails=()
+    while read -r email; do
+        [[ "$email" == "smart" ]] && continue
+        emails+=("$email")
+    done < <(list_vless_clients)
+
+    if [[ ${#emails[@]} -eq 0 ]]; then
+        echo "  (没有可删除的节点，smart 节点不可删除)"
+        press_enter
+        return
+    fi
+
+    echo "可删除的节点:"
+    local i=1
+    for email in "${emails[@]}"; do
+        local out
+        out=$(get_vless_outbound "$email")
+        printf "  [%d] %-12s → %s\n" "$i" "$email" "$out"
+        ((i++))
+    done
+    echo "  (smart 节点不可删除)"
+    echo ""
+    read -rp "选择要删除的编号: " idx
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#emails[@]} )); then
+        warn "无效编号"
+        press_enter
+        return
+    fi
+
+    local del_email="${emails[$((idx-1))]}"
+
+    # 删除 client
+    update_base '(.inbounds[] | select(.tag=="vless-reality")).settings.clients |= map(select(.email != $email))' \
+        --arg email "$del_email"
+
+    # 删除 routing rule
+    update_base '.routing.rules |= map(select((.user // []) | index($email) | not))' \
+        --arg email "$del_email"
+
+    restart_xray
+    info "VLESS 节点 $del_email 已删除"
+    press_enter
+}
+
+# ═══════════════════════════════════════════════════
+#  SS2022 节点管理
+# ═══════════════════════════════════════════════════
+list_ss_clients() {
+    jq -r '(.inbounds[] | select(.tag=="ss2022")).settings.clients[] | .email' "$CONF_BASE" 2>/dev/null
+}
+
+get_ss_outbound() {
+    local email="$1"
+    if [[ "$email" == "ss-smart" ]]; then
+        echo "(smart路由，编辑 10-custom.json)"
+        return
+    fi
+    local out
+    out=$(jq -r --arg email "$email" '.routing.rules[] | select(.user and (.user | index($email))) | .outboundTag' "$CONF_BASE" 2>/dev/null || true)
+    if [[ -z "$out" ]]; then
+        echo "direct (默认)"
+    else
+        echo "$out"
+    fi
+}
+
+show_ss_menu() {
+    ensure_installed || return
+
+    while true; do
+        title "SS2022 节点管理"
+
+        echo "当前节点:"
+        local i=1
+        while read -r email; do
+            local out
+            out=$(get_ss_outbound "$email")
+            if [[ "$email" == "ss-smart" ]]; then
+                printf "  [%d] %-14s → %s    ← 不可删除\n" "$i" "$email" "$out"
+            else
+                printf "  [%d] %-14s → %s\n" "$i" "$email" "$out"
+            fi
+            ((i++))
+        done < <(list_ss_clients)
+
+        echo ""
+        echo "操作:"
+        echo "  a) 添加节点"
+        echo "  d) 删除节点"
+        echo "  0) 返回主菜单"
+        echo ""
+        read -rp "请选择: " choice
+
+        case "$choice" in
+            a) add_ss ;;
+            d) delete_ss ;;
+            0) return ;;
+            *) warn "无效选项" ;;
+        esac
+    done
+}
+
+add_ss() {
+    title "添加 SS2022 节点"
+
+    local name
+    read -rp "节点名称 (如 us, jp): " name
+    name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    if [[ -z "$name" ]]; then
+        error "名称不能为空"
+        press_enter
+        return
+    fi
+
+    local email="ss-${name}"
+
+    # 检查是否已存在
+    if jq -e --arg email "$email" '(.inbounds[] | select(.tag=="ss2022")).settings.clients[] | select(.email==$email)' "$CONF_BASE" >/dev/null 2>&1; then
+        error "节点 $email 已存在"
+        press_enter
+        return
+    fi
+
+    # 选择出站
+    echo ""
+    echo "可用出站:"
+    local out_tags=()
+    local j=1
+    while IFS=$'\t' read -r tag proto dest; do
+        out_tags+=("$tag")
+        printf "  [%d] %s" "$j" "$tag"
+        [[ "$dest" != "-" ]] && printf " (%s → %s)" "$proto" "$dest"
+        echo ""
+        ((j++))
+    done < <(list_outbounds)
+    echo ""
+    read -rp "选择出站 [1-${#out_tags[@]}]: " oidx
+    if ! [[ "$oidx" =~ ^[0-9]+$ ]] || (( oidx < 1 || oidx > ${#out_tags[@]} )); then
+        warn "无效编号"
+        press_enter
+        return
+    fi
+    local out_tag="${out_tags[$((oidx-1))]}"
+
+    # 生成用户密钥
+    local user_key
+    user_key=$(gen_ss_key)
+
+    # 添加 client
+    update_base '(.inbounds[] | select(.tag=="ss2022")).settings.clients += [{"password":$pw,"email":$email}]' \
+        --arg pw "$user_key" --arg email "$email"
+
+    # 添加 routing rule（如果不是 direct）
+    if [[ "$out_tag" != "direct" ]]; then
+        update_base '.routing.rules += [{"type":"field","user":[$user],"outboundTag":$out}]' \
+            --arg user "$email" --arg out "$out_tag"
+    fi
+
+    restart_xray
+
+    echo ""
+    info "SS2022 节点 $email 已添加 (出站: $out_tag)"
+    echo ""
+    echo -e "${BOLD}用户密钥:${NC} $user_key"
+    echo -e "${BOLD}分享链接:${NC}"
+    gen_ss_link "$user_key" "$email"
+    press_enter
+}
+
+delete_ss() {
+    title "删除 SS2022 节点"
+
+    local emails=()
+    while read -r email; do
+        [[ "$email" == "ss-smart" ]] && continue
+        emails+=("$email")
+    done < <(list_ss_clients)
+
+    if [[ ${#emails[@]} -eq 0 ]]; then
+        echo "  (没有可删除的节点，ss-smart 节点不可删除)"
+        press_enter
+        return
+    fi
+
+    echo "可删除的节点:"
+    local i=1
+    for email in "${emails[@]}"; do
+        local out
+        out=$(get_ss_outbound "$email")
+        printf "  [%d] %-14s → %s\n" "$i" "$email" "$out"
+        ((i++))
+    done
+    echo "  (ss-smart 节点不可删除)"
+    echo ""
+    read -rp "选择要删除的编号: " idx
+    if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#emails[@]} )); then
+        warn "无效编号"
+        press_enter
+        return
+    fi
+
+    local del_email="${emails[$((idx-1))]}"
+
+    # 删除 client
+    update_base '(.inbounds[] | select(.tag=="ss2022")).settings.clients |= map(select(.email != $email))' \
+        --arg email "$del_email"
+
+    # 删除 routing rule
+    update_base '.routing.rules |= map(select((.user // []) | index($email) | not))' \
+        --arg email "$del_email"
+
+    restart_xray
+    info "SS2022 节点 $del_email 已删除"
+    press_enter
+}
+
+# ═══════════════════════════════════════════════════
+#  查看分享链接
+# ═══════════════════════════════════════════════════
+show_links() {
+    ensure_installed || return
+    title "分享链接"
+
+    echo -e "${BOLD}=== VLESS+REALITY ===${NC}"
+    while read -r email; do
+        local uuid
+        uuid=$(jq -r --arg e "$email" '(.inbounds[] | select(.tag=="vless-reality")).settings.clients[] | select(.email==$e) | .id' "$CONF_BASE")
+        echo -e "${CYAN}[$email]${NC}"
+        gen_vless_link "$uuid" "$email"
+        echo ""
+    done < <(list_vless_clients)
+
+    echo -e "${BOLD}=== SS2022 ===${NC}"
+    while read -r email; do
+        local pw
+        pw=$(jq -r --arg e "$email" '(.inbounds[] | select(.tag=="ss2022")).settings.clients[] | select(.email==$e) | .password' "$CONF_BASE")
+        echo -e "${CYAN}[$email]${NC}"
+        gen_ss_link "$pw" "$email"
+        echo ""
+    done < <(list_ss_clients)
+
+    press_enter
+}
+
+# ═══════════════════════════════════════════════════
+#  服务管理
+# ═══════════════════════════════════════════════════
+show_service_menu() {
+    ensure_installed || return
+
+    while true; do
+        title "服务管理"
+
+        echo "容器状态:"
+        for name in caddy xray fake-site; do
+            local status
+            status=$(docker ps -a --filter "name=^${name}$" --format '{{.Status}}' 2>/dev/null || echo "not found")
+            if echo "$status" | grep -qi "up"; then
+                echo -e "  ${name}\t${GREEN}● running${NC}  ($status)"
+            elif [[ -z "$status" || "$status" == "not found" ]]; then
+                echo -e "  ${name}\t${RED}● not found${NC}"
+            else
+                echo -e "  ${name}\t${RED}● stopped${NC}  ($status)"
+            fi
+        done
+
+        echo ""
+        echo "操作:"
+        echo "  1) 重启 xray"
+        echo "  2) 重启 caddy"
+        echo "  3) 重启 fake-site"
+        echo "  4) 重启全部"
+        echo "  5) 拉取最新镜像并重启全部"
+        echo "  0) 返回主菜单"
+        echo ""
+        read -rp "请选择: " choice
+
+        case "$choice" in
+            1)
+                if cd "$DIR_XRAY" && docker compose restart 2>&1; then info "xray 已重启"
+                else error "xray 重启失败"; fi; press_enter ;;
+            2)
+                if cd "$DIR_CADDY" && docker compose restart 2>&1; then info "caddy 已重启"
+                else error "caddy 重启失败"; fi; press_enter ;;
+            3)
+                if cd "$DIR_SITE" && docker compose restart 2>&1; then info "fake-site 已重启"
+                else error "fake-site 重启失败"; fi; press_enter ;;
+            4)
+                local fail=false
+                cd "$DIR_XRAY"  && docker compose restart 2>&1 || fail=true
+                cd "$DIR_CADDY" && docker compose restart 2>&1 || fail=true
+                cd "$DIR_SITE"  && docker compose restart 2>&1 || fail=true
+                if [[ "$fail" == "false" ]]; then info "全部容器已重启"
+                else warn "部分容器重启失败，请检查上方输出"; fi
+                press_enter
+                ;;
+            5)
+                local fail=false
+                echo "拉取最新镜像..."
+                cd "$DIR_SITE"  && docker compose pull -q  || { error "fake-site 镜像拉取失败"; fail=true; }
+                cd "$DIR_CADDY" && docker compose pull -q  || { error "caddy 镜像拉取失败"; fail=true; }
+                cd "$DIR_XRAY"  && docker compose pull -q  || { error "xray 镜像拉取失败"; fail=true; }
+                echo "重启容器..."
+                cd "$DIR_SITE"  && docker compose up -d 2>&1 || fail=true
+                cd "$DIR_CADDY" && docker compose up -d 2>&1 || fail=true
+                cd "$DIR_XRAY"  && docker compose up -d 2>&1 || fail=true
+                if [[ "$fail" == "false" ]]; then info "镜像已更新，全部容器已重启"
+                else warn "部分操作失败，请检查上方输出"; fi
+                press_enter
+                ;;
+            0) return ;;
+            *) warn "无效选项" ;;
+        esac
+    done
+}
+
+# ═══════════════════════════════════════════════════
+#  卸载
+# ═══════════════════════════════════════════════════
+do_uninstall() {
+    ensure_installed || return
+    title "卸载"
+
+    echo -e "${YELLOW}⚠ 即将删除:${NC}"
+    echo "  • xray 容器 + 配置 + 密钥   ($DIR_XRAY/)"
+    echo "  • fake-site 容器             ($DIR_SITE/)"
+    echo "  • caddy 容器 + 证书 volume"
+    echo ""
+    echo -e "${GREEN}✓ 保留:${NC}"
+    echo "  • caddy-l4 配置文件          ($DIR_CADDY/Caddyfile, .env, docker-compose.yml)"
+    echo "  • proxy Docker 网络"
+    echo ""
+    read -rp "确认卸载？[y/N]: " confirm
+    [[ "$confirm" =~ ^[yY] ]] || return
+
+    echo ""
+
+    # 停止并删除容器
+    if [[ -d "$DIR_XRAY" ]]; then
+        cd "$DIR_XRAY" && docker compose down 2>/dev/null || true
+        info "xray 容器已停止"
+    fi
+    if [[ -d "$DIR_SITE" ]]; then
+        cd "$DIR_SITE" && docker compose down 2>/dev/null || true
+        info "fake-site 容器已停止"
+    fi
+    if [[ -d "$DIR_CADDY" ]]; then
+        cd "$DIR_CADDY" && docker compose down -v 2>/dev/null || true
+        info "caddy 容器已停止，证书 volume 已删除"
+    fi
+
+    # 删除数据目录
+    rm -rf "$DIR_XRAY"
+    info "已删除 $DIR_XRAY"
+    rm -rf "$DIR_SITE"
+    info "已删除 $DIR_SITE"
+
+    # 保留 caddy-l4 配置文件
+    info "已保留 $DIR_CADDY/ 目录 (Caddyfile + docker-compose.yml)"
+
+    echo ""
+    echo -e "${GREEN}✓ 卸载完成${NC}"
+    echo ""
+    echo "已保留 $DIR_CADDY/ 目录（Caddyfile + docker-compose.yml）"
+    echo "如需恢复 caddy 服务: cd $DIR_CADDY && docker compose up -d"
+    echo "如需清理 xray 路由: 编辑 $DIR_CADDY/Caddyfile 删除相关配置块"
+    press_enter
+}
+
+# ═══════════════════════════════════════════════════
+#  主菜单
+# ═══════════════════════════════════════════════════
+show_main_menu() {
+    clear
+    echo -e "${BOLD}${CYAN}"
+    echo "╔══════════════════════════════════╗"
+    echo "║       xproxy 管理面板            ║"
+    echo "╚══════════════════════════════════╝"
+    echo -e "${NC}"
+
+    if is_installed; then
+        local node
+        node=$(get_node)
+        echo -e "  状态: ${GREEN}已安装${NC}  节点: ${BOLD}${node}.${DOMAIN}${NC}"
+    else
+        echo -e "  状态: ${YELLOW}未安装${NC}"
+    fi
+
+    echo ""
+    echo "  1) 安装部署"
+    echo "  2) 管理出站 (outbound)"
+    echo "  3) 管理 VLESS 节点"
+    echo "  4) 管理 SS2022 节点"
+    echo "  5) 查看分享链接"
+    echo "  6) 服务管理"
+    echo "  7) 卸载"
+    echo ""
+    echo "  0) 退出"
+    echo ""
+    read -rp "请选择 [0-7]: " choice
+    echo ""
+    case "$choice" in
+        1) do_install ;;
+        2) show_outbound_menu ;;
+        3) show_vless_menu ;;
+        4) show_ss_menu ;;
+        5) show_links ;;
+        6) show_service_menu ;;
+        7) do_uninstall ;;
+        0) echo "再见！"; exit 0 ;;
+        *) warn "无效选项" ;;
+    esac
+}
+
+# ── 入口 ──
+check_root
+
+while true; do
+    show_main_menu
+done
