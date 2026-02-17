@@ -179,6 +179,30 @@ outbound_exists() {
     [[ "$found" == "true" ]]
 }
 
+# ── 安装回滚（清理半成品） ──
+_INSTALL_CREATED_NETWORK=false
+
+install_rollback() {
+    trap - ERR
+    warn "正在回滚安装..."
+    if [[ -d "$DIR_XRAY" ]]; then
+        cd "$DIR_XRAY" && docker compose down 2>/dev/null || true
+    fi
+    if [[ -d "$DIR_SITE" ]]; then
+        cd "$DIR_SITE" && docker compose down 2>/dev/null || true
+    fi
+    if [[ -d "$DIR_CADDY" ]]; then
+        cd "$DIR_CADDY" && docker compose down -v 2>/dev/null || true
+    fi
+    rm -rf "$DIR_XRAY" "$DIR_SITE" "$DIR_CADDY"
+    if [[ "$_INSTALL_CREATED_NETWORK" == "true" ]]; then
+        docker network rm "$DOCKER_NETWORK" 2>/dev/null || true
+    fi
+    _INSTALL_CREATED_NETWORK=false
+    error "安装已回滚，请检查上方错误信息"
+    press_enter
+}
+
 # ═══════════════════════════════════════════════════
 #  安装部署
 # ═══════════════════════════════════════════════════
@@ -239,11 +263,15 @@ do_install() {
     read -rp "确认开始安装？[Y/n]: " confirm
     [[ "$confirm" =~ ^[nN] ]] && return
 
+    # 部署阶段：任何未捕获的失败自动回滚
+    trap 'install_rollback' ERR
     echo ""
 
     # [3] 创建 Docker 网络
+    _INSTALL_CREATED_NETWORK=false
     if ! docker network inspect "$DOCKER_NETWORK" &>/dev/null; then
         docker network create "$DOCKER_NETWORK" >/dev/null
+        _INSTALL_CREATED_NETWORK=true
         info "Docker 网络 $DOCKER_NETWORK 已创建"
     else
         info "Docker 网络 $DOCKER_NETWORK 已存在"
@@ -394,20 +422,24 @@ EOF
     # 生成密钥
     echo "  生成密钥..."
     local x25519_output priv_key pub_key short_id smart_uuid ss_server_key ss_smart_key
-    x25519_output=$(docker run --rm "$XRAY_IMAGE" x25519)
-    priv_key=$(echo "$x25519_output" | grep "Private key:" | awk '{print $3}')
-    pub_key=$(echo "$x25519_output" | grep "Public key:" | awk '{print $3}')
+    x25519_output=$(docker run --rm "$XRAY_IMAGE" x25519) || true
+    # 按行取最后字段，兼容新旧格式:
+    #   旧: "Private key: xxx" / "Public key: xxx"
+    #   新: "PrivateKey: xxx"  / "PublicKey: xxx" 或 "Password: xxx"
+    priv_key=$(echo "$x25519_output" | awk 'NR==1{print $NF}')
+    pub_key=$(echo "$x25519_output" | awk 'NR==2{print $NF}')
     if [[ -z "$priv_key" || -z "$pub_key" ]]; then
-        error "无法解析 x25519 密钥（xray 输出格式可能已变更）"
-        echo "原始输出: $x25519_output"
-        press_enter
+        error "无法解析 x25519 密钥"
+        echo "原始输出:"
+        echo "$x25519_output"
+        install_rollback
         return
     fi
     short_id=$(gen_short_id)
-    smart_uuid=$(docker run --rm "$XRAY_IMAGE" uuid)
+    smart_uuid=$(docker run --rm "$XRAY_IMAGE" uuid) || true
     if [[ -z "$smart_uuid" ]]; then
-        error "无法生成 UUID（xray 输出格式可能已变更）"
-        press_enter
+        error "无法生成 UUID"
+        install_rollback
         return
     fi
     ss_server_key=$(gen_ss_key)
@@ -526,6 +558,9 @@ YAML
     cd "$DIR_XRAY"
     docker compose up -d
     info "xray 已部署"
+
+    # 部署完成，清除 ERR trap（避免验证/输出阶段的无害失败触发回滚）
+    trap - ERR
 
     # [7] 验证
     echo ""
@@ -1289,7 +1324,7 @@ show_main_menu() {
         5) show_links ;;
         6) show_service_menu ;;
         7) do_uninstall ;;
-        0) echo "再见！"; exit 0 ;;
+        0) echo "再见！"; exit 42 ;;
         *) warn "无效选项" ;;
     esac
 }
@@ -1298,5 +1333,11 @@ show_main_menu() {
 check_root
 
 while true; do
-    show_main_menu
+    rc=0
+    ( show_main_menu ) || rc=$?
+    if [[ $rc -eq 42 ]]; then
+        exit 0
+    elif [[ $rc -ne 0 ]]; then
+        press_enter
+    fi
 done
