@@ -95,6 +95,17 @@ get_public_key() { meta_get "reality_public_key"; }
 get_short_id()  { meta_get "short_id"; }
 get_api_port()  { meta_get "api_port"; }
 
+get_public_ip() {
+    local ip
+    ip=$(curl -4 -s --max-time 10 https://one.one.one.one/cdn-cgi/trace | grep -oP 'ip=\K.*' || true)
+    if [[ -z "$ip" ]]; then
+        warn "无法获取公网 IP，链接将使用域名"
+        get_fqdn
+    else
+        echo "$ip"
+    fi
+}
+
 # ── 密钥生成 ──
 gen_short_id() { openssl rand -hex 8; }
 
@@ -153,22 +164,22 @@ parse_ss_link() {
 
 # ── 分享链接生成 ──
 gen_vless_link() {
-    local uuid="$1" email="$2"
+    local uuid="$1" email="$2" server="$3"
     local node fqdn pbk sid label
     node=$(get_node); fqdn=$(get_fqdn); pbk=$(get_public_key); sid=$(get_short_id)
     label=$(echo "${node}-${email}" | tr '[:lower:]' '[:upper:]')
-    echo "vless://${uuid}@${fqdn}:443?type=tcp&security=reality&sni=${fqdn}&fp=chrome&pbk=${pbk}&sid=${sid}&flow=xtls-rprx-vision#${label}"
+    echo "vless://${uuid}@${server}:443?type=tcp&security=reality&sni=${fqdn}&fp=chrome&pbk=${pbk}&sid=${sid}&flow=xtls-rprx-vision#${label}"
 }
 
 gen_ss_link() {
-    local user_key="$1" email="$2"
-    local node fqdn server_key method userinfo label
-    node=$(get_node); fqdn=$(get_fqdn)
+    local user_key="$1" email="$2" server="$3"
+    local node server_key method userinfo label
+    node=$(get_node)
     server_key=$(jq -r '(.inbounds[] | select(.tag=="ss2022")).settings.password' "$CONF_BASE")
     method="$SS_METHOD"
     userinfo=$(base64url_encode "${method}:${server_key}:${user_key}")
     label=$(echo "${node}-${email}" | tr '[:lower:]' '[:upper:]')
-    echo "ss://${userinfo}@${fqdn}:${SS_PORT}#${label}"
+    echo "ss://${userinfo}@${server}:${SS_PORT}#${label}"
 }
 
 # ── jq 辅助 ──
@@ -668,16 +679,17 @@ EOF
     fi
 
     # [11] 输出结果
+    local pub_ip; pub_ip=$(get_public_ip)
     echo ""
     echo -e "${BOLD}${GREEN}════════ 安装完成 ════════${NC}"
     echo ""
     echo -e "${BOLD}=== VLESS+REALITY ===${NC}"
     echo -e "${CYAN}[smart]${NC}"
-    gen_vless_link "$smart_uuid" "smart"
+    gen_vless_link "$smart_uuid" "smart" "$pub_ip"
     echo ""
     echo -e "${BOLD}=== SS2022 ===${NC}"
     echo -e "${CYAN}[ss-smart]${NC}"
-    gen_ss_link "$ss_smart_key" "ss-smart"
+    gen_ss_link "$ss_smart_key" "ss-smart" "$pub_ip"
     echo ""
     if [[ "$all_ok" == "false" ]]; then
         warn "部分服务未正常启动，请检查 journalctl -u xray / journalctl -u caddy"
@@ -918,7 +930,8 @@ add_vless() {
     echo ""
     info "VLESS 节点 $name 已添加 (出站: $out_tag)"
     echo -e "${BOLD}分享链接:${NC}"
-    gen_vless_link "$uuid" "$name"
+    local pub_ip; pub_ip=$(get_public_ip)
+    gen_vless_link "$uuid" "$name" "$pub_ip"
     press_enter
 }
 
@@ -1026,7 +1039,8 @@ add_ss() {
     echo ""
     info "SS2022 节点 $email 已添加 (出站: $out_tag)"
     echo -e "${BOLD}分享链接:${NC}"
-    gen_ss_link "$user_key" "$email"
+    local pub_ip; pub_ip=$(get_public_ip)
+    gen_ss_link "$user_key" "$email" "$pub_ip"
     press_enter
 }
 
@@ -1063,13 +1077,14 @@ delete_ss() {
 show_links() {
     ensure_installed || return
     title "分享链接"
+    local pub_ip; pub_ip=$(get_public_ip)
 
     echo -e "${BOLD}=== VLESS+REALITY ===${NC}"
     while read -r email; do
         local uuid
         uuid=$(jq -r --arg e "$email" '(.inbounds[] | select(.tag=="vless-reality")).settings.clients[] | select(.email==$e) | .id' "$CONF_BASE")
         echo -e "${CYAN}[$email]${NC}"
-        gen_vless_link "$uuid" "$email"
+        gen_vless_link "$uuid" "$email" "$pub_ip"
         echo ""
     done < <(list_vless_clients)
 
@@ -1078,7 +1093,7 @@ show_links() {
         local pw
         pw=$(jq -r --arg e "$email" '(.inbounds[] | select(.tag=="ss2022")).settings.clients[] | select(.email==$e) | .password' "$CONF_BASE")
         echo -e "${CYAN}[$email]${NC}"
-        gen_ss_link "$pw" "$email"
+        gen_ss_link "$pw" "$email" "$pub_ip"
         echo ""
     done < <(list_ss_clients)
 
