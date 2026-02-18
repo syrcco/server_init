@@ -150,7 +150,7 @@ base64url_decode() {
     if [[ $mod -eq 2 ]]; then input="${input}=="
     elif [[ $mod -eq 3 ]]; then input="${input}="
     fi
-    echo "$input" | tr '-_' '+/' | base64 -d
+    echo "$input" | tr -- '-_' '+/' | base64 -d
 }
 
 # ── SS 链接解析 ──
@@ -158,14 +158,28 @@ parse_ss_link() {
     local link="$1"
     link="${link#ss://}"
     local main="${link%%#*}"
-    local userinfo="${main%@*}"
-    local hostport="${main##*@}"
-    local decoded
-    decoded=$(base64url_decode "$userinfo")
-    SS_PARSED_METHOD="${decoded%%:*}"
-    SS_PARSED_PASSWORD="${decoded#*:}"
-    SS_PARSED_ADDR="${hostport%:*}"
-    SS_PARSED_PORT="${hostport##*:}"
+
+    if [[ "$main" == *@* ]]; then
+        # SIP002: BASE64URL(method:password)@host:port
+        local userinfo="${main%@*}"
+        local hostport="${main##*@}"
+        local decoded
+        decoded=$(base64url_decode "$userinfo")
+        SS_PARSED_METHOD="${decoded%%:*}"
+        SS_PARSED_PASSWORD="${decoded#*:}"
+        SS_PARSED_ADDR="${hostport%:*}"
+        SS_PARSED_PORT="${hostport##*:}"
+    else
+        # Legacy: BASE64(method:password@host:port)
+        local decoded
+        decoded=$(base64url_decode "$main")
+        local userinfo="${decoded%@*}"
+        local hostport="${decoded##*@}"
+        SS_PARSED_METHOD="${userinfo%%:*}"
+        SS_PARSED_PASSWORD="${userinfo#*:}"
+        SS_PARSED_ADDR="${hostport%:*}"
+        SS_PARSED_PORT="${hostport##*:}"
+    fi
 }
 
 # ── 分享链接生成 ──
