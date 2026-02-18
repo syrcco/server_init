@@ -514,7 +514,8 @@ YAML
             },
             "sniffing": {
               "enabled": true,
-              "destOverride": ["http", "tls", "quic"]
+              "destOverride": ["http", "tls"],
+              "routeOnly": true
             }
           },
           {
@@ -529,15 +530,25 @@ YAML
                 { "password": $ss_usr, "email": "ss-smart" }
               ],
               "network": "tcp,udp"
+            },
+            "sniffing": {
+              "enabled": true,
+              "destOverride": ["http", "tls"]
             }
           }
         ],
         "outbounds": [
-          { "tag": "direct", "protocol": "freedom" }
+          { "tag": "direct", "protocol": "freedom" },
+          { "tag": "block", "protocol": "blackhole" }
         ],
         "routing": {
-          "domainStrategy": "AsIs",
-          "rules": []
+          "domainStrategy": "IPIfNonMatch",
+          "rules": [
+            { "type": "field", "protocol": ["bittorrent"], "outboundTag": "block" },
+            { "type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block" },
+            { "type": "field", "ip": ["geoip:cn"], "outboundTag": "block" },
+            { "type": "field", "ip": ["geoip:private"], "outboundTag": "block" }
+          ]
         }
       }' > "$CONF_BASE"
 
@@ -777,15 +788,15 @@ add_outbound() {
 delete_outbound() {
     title "删除出站"
 
-    # 列出可删除的出站（排除 direct）
+    # 列出可删除的出站（排除 direct 和 block）
     local tags=()
     while IFS=$'\t' read -r tag proto dest; do
-        [[ "$tag" == "direct" ]] && continue
+        [[ "$tag" == "direct" || "$tag" == "block" ]] && continue
         tags+=("$tag")
     done < <(list_outbounds)
 
     if [[ ${#tags[@]} -eq 0 ]]; then
-        echo "  (没有可删除的出站，direct 不可删除)"
+        echo "  (没有可删除的出站，direct/block 不可删除)"
         press_enter
         return
     fi
@@ -801,7 +812,7 @@ delete_outbound() {
         echo ")"
         ((i++))
     done
-    echo "  (direct 不可删除)"
+    echo "  (direct/block 不可删除)"
     echo ""
     read -rp "选择要删除的编号: " idx
     if ! [[ "$idx" =~ ^[0-9]+$ ]] || (( idx < 1 || idx > ${#tags[@]} )); then
