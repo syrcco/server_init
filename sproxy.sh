@@ -267,10 +267,10 @@ rebuild_route_rules() {
     # 默认屏蔽规则（全局）
     defaults='[
       {"action":"sniff"},
-      {"protocol":"bittorrent","action":"block"},
-      {"rule_set":"geosite-ads","action":"block"},
-      {"rule_set":"geoip-cn","action":"block"},
-      {"ip_is_private":true,"action":"block"}
+      {"protocol":"bittorrent","outbound":"block"},
+      {"rule_set":"geosite-ads","outbound":"block"},
+      {"rule_set":"geoip-cn","outbound":"block"},
+      {"ip_is_private":true,"outbound":"block"}
     ]'
 
     # 合并顺序: per-user → smart 自定义 → 默认屏蔽 → direct(隐式)
@@ -492,7 +492,7 @@ do_install_lite() {
           rules: [{
             rule_set: "geoip-cn",
             rule_set_ip_cidr_match_source: true,
-            action: "block"
+            outbound: "block"
           }]
         }
       }' > "$CONF_FILE"
@@ -710,11 +710,11 @@ install_rollback() {
         cd "$DIR_SITE" && docker compose down 2>/dev/null || true
     fi
     rm -rf "$DIR_BASE" "$DIR_CADDY" "$DIR_SITE"
-    ufw delete --force allow 443/tcp 2>/dev/null || true
-    ufw delete --force allow "${CADDY_HTTPS_PORT}/tcp" 2>/dev/null || true
-    ufw delete --force allow 80/tcp 2>/dev/null || true
-    ufw delete --force allow "${SS_PORT}/tcp" 2>/dev/null || true
-    ufw delete --force allow "${SS_PORT}/udp" 2>/dev/null || true
+    ufw --force delete allow 443/tcp 2>/dev/null || true
+    ufw --force delete allow "${CADDY_HTTPS_PORT}/tcp" 2>/dev/null || true
+    ufw --force delete allow 80/tcp 2>/dev/null || true
+    ufw --force delete allow "${SS_PORT}/tcp" 2>/dev/null || true
+    ufw --force delete allow "${SS_PORT}/udp" 2>/dev/null || true
     error "安装已回滚，请检查上方错误信息"
     press_enter
 }
@@ -918,10 +918,10 @@ EOF
           ],
           rules: [
             { action: "sniff" },
-            { protocol: "bittorrent", action: "block" },
-            { rule_set: "geosite-ads", action: "block" },
-            { rule_set: "geoip-cn", action: "block" },
-            { ip_is_private: true, action: "block" }
+            { protocol: "bittorrent", outbound: "block" },
+            { rule_set: "geosite-ads", outbound: "block" },
+            { rule_set: "geoip-cn", outbound: "block" },
+            { ip_is_private: true, outbound: "block" }
           ]
         }
       }' > "$CONF_FILE"
@@ -1043,8 +1043,8 @@ gen_ss2022_link() {
 ufw_clean_port() {
     local port="$1"
     command -v ufw &>/dev/null || return 0
-    ufw delete --force allow "$port/tcp" 2>/dev/null || true
-    ufw delete --force allow "$port/udp" 2>/dev/null || true
+    ufw --force delete allow "$port/tcp" 2>/dev/null || true
+    ufw --force delete allow "$port/udp" 2>/dev/null || true
     while ufw status numbered | grep -qE "\\b${port}/(tcp|udp)\\b"; do
         local num
         num=$(ufw status numbered | grep -E "\\b${port}/(tcp|udp)\\b" | head -1 | grep -oE '^\[ *[0-9]+\]' | tr -dc '0-9')
@@ -1063,8 +1063,8 @@ apply_ss_whitelist() {
         return 0
     fi
     # 先清除该端口所有规则
-    ufw delete --force allow "$port/tcp" 2>/dev/null || true
-    ufw delete --force allow "$port/udp" 2>/dev/null || true
+    ufw --force delete allow "$port/tcp" 2>/dev/null || true
+    ufw --force delete allow "$port/udp" 2>/dev/null || true
     # 清除已有的 per-IP 规则
     while ufw status numbered | grep -qE "\\b${port}/(tcp|udp)\\b"; do
         local num
@@ -1210,7 +1210,7 @@ hy2_disable() {
     read -rp "确认关闭 Hysteria2？[y/N]: " confirm
     [[ "$confirm" =~ ^[yY] ]] || return
     update_config '.inbounds |= map(select(.tag != "hy2"))'
-    ufw delete --force allow "${HY2_PORT}/udp" 2>/dev/null || true
+    ufw --force delete allow "${HY2_PORT}/udp" 2>/dev/null || true
     if jq 'del(.hy2_port)' "$META_FILE" > "${META_FILE}.tmp"; then
         mv -f "${META_FILE}.tmp" "$META_FILE"
     fi
@@ -1350,7 +1350,7 @@ legacy_ss_enable() {
         --arg method "$method" --arg pw "$password" --argjson port "$port" \
         '{type:"shadowsocks",tag:"ss-legacy",listen:"::",listen_port:$port,method:$method,password:$pw}')"
     # 封禁大陆来源 IP（仅 ss-legacy）
-    update_config '.route.rules += [$r]' --argjson r '{"inbound":["ss-legacy"],"rule_set":"geoip-cn","rule_set_ip_cidr_match_source":true,"action":"block"}'
+    update_config '.route.rules += [$r]' --argjson r '{"inbound":["ss-legacy"],"rule_set":"geoip-cn","rule_set_ip_cidr_match_source":true,"outbound":"block"}'
     apply_ss_whitelist "$port"
     restart_sproxy || { press_enter; return; }
 
