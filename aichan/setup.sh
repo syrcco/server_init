@@ -710,34 +710,35 @@ if [[ -f "$SUDOERS_FILE" ]]; then
     success "sudoers 配置完成"
 fi
 
-# ── 配置 ufw（L3/L4 自动执行） ────────────────────────────────────────────────
+# ── 配置 ufw（所有级别执行 SSH 专项放行，L3/L4 额外加全局白名单） ───────────────
 AICHAN_IP="15.235.184.76"
 
-if [[ "$LEVEL" == "L3" || "$LEVEL" == "L4" ]]; then
-    if command -v ufw &>/dev/null; then
-        info "检查 ufw 白名单..."
+if command -v ufw &>/dev/null; then
+    info "检查 ufw 防火墙配置..."
 
-        # 1. 放行 aichan IP 的所有流量（全局白名单）
+    # 检测当前 SSH 端口
+    SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | grep -oP ':\K\d+' | head -1)
+    SSH_PORT="${SSH_PORT:-22}"
+
+    # 所有级别：针对 SSH 端口加专项 allow（绕过 ufw limit，确保备份 rsync 不被限速）
+    if ufw status verbose 2>/dev/null | grep -q "${AICHAN_IP}.*${SSH_PORT}"; then
+        info "爱衣 IP 对 SSH 端口 $SSH_PORT 的专项规则已存在，跳过"
+    else
+        ufw allow from "$AICHAN_IP" to any port "$SSH_PORT" proto tcp comment 'aichan ssh port allow'
+        success "已为 $AICHAN_IP 添加 SSH 端口 $SSH_PORT 专项放行规则"
+    fi
+
+    # L3/L4：额外加全局白名单（允许所有端口，用于 rsync 等操作）
+    if [[ "$LEVEL" == "L3" || "$LEVEL" == "L4" ]]; then
         if ufw status | grep -q "$AICHAN_IP"; then
-            info "爱衣 IP $AICHAN_IP 已在白名单，跳过"
+            info "爱衣 IP $AICHAN_IP 全局白名单已存在，跳过"
         else
             ufw allow from "$AICHAN_IP" comment 'aichan operator'
             success "已将 $AICHAN_IP 加入 ufw 全局白名单"
         fi
-
-        # 2. 针对当前 SSH 端口额外加 allow（绕过 ufw limit，规则优先级更明确）
-        SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | grep -oP ':\K\d+' | head -1)
-        SSH_PORT="${SSH_PORT:-22}"
-        RULE_COMMENT="aichan ssh port allow"
-        if ufw status verbose | grep -q "${AICHAN_IP}.*${SSH_PORT}"; then
-            info "爱衣 IP 对 SSH 端口 $SSH_PORT 的专项规则已存在，跳过"
-        else
-            ufw allow from "$AICHAN_IP" to any port "$SSH_PORT" proto tcp comment "$RULE_COMMENT"
-            success "已为 $AICHAN_IP 添加 SSH 端口 $SSH_PORT 专项放行规则（绕过 ufw limit）"
-        fi
-    else
-        warn "ufw 未安装，跳过防火墙配置"
     fi
+else
+    warn "ufw 未安装，跳过防火墙配置"
 fi
 
 # ── 完成 ──────────────────────────────────────────────────────────────────────
