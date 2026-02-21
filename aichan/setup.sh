@@ -716,12 +716,24 @@ AICHAN_IP="15.235.184.76"
 if [[ "$LEVEL" == "L3" || "$LEVEL" == "L4" ]]; then
     if command -v ufw &>/dev/null; then
         info "检查 ufw 白名单..."
-        # 只检查爱衣 IP 是否已放行，不在则加入，其他规则一律不动
+
+        # 1. 放行 aichan IP 的所有流量（全局白名单）
         if ufw status | grep -q "$AICHAN_IP"; then
             info "爱衣 IP $AICHAN_IP 已在白名单，跳过"
         else
             ufw allow from "$AICHAN_IP" comment 'aichan operator'
-            success "已将 $AICHAN_IP 加入 ufw 白名单"
+            success "已将 $AICHAN_IP 加入 ufw 全局白名单"
+        fi
+
+        # 2. 针对当前 SSH 端口额外加 allow（绕过 ufw limit，规则优先级更明确）
+        SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | grep -oP ':\K\d+' | head -1)
+        SSH_PORT="${SSH_PORT:-22}"
+        RULE_COMMENT="aichan ssh port allow"
+        if ufw status verbose | grep -q "${AICHAN_IP}.*${SSH_PORT}"; then
+            info "爱衣 IP 对 SSH 端口 $SSH_PORT 的专项规则已存在，跳过"
+        else
+            ufw allow from "$AICHAN_IP" to any port "$SSH_PORT" proto tcp comment "$RULE_COMMENT"
+            success "已为 $AICHAN_IP 添加 SSH 端口 $SSH_PORT 专项放行规则（绕过 ufw limit）"
         fi
     else
         warn "ufw 未安装，跳过防火墙配置"
