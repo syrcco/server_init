@@ -494,6 +494,57 @@ fi
 exec /bin/systemctl "$@"
 WRAPPER_EOF
 
+# aichan-ufw — ufw 白名单包装脚本（仅允许安全子命令）
+cat > "$WRAPPER_DIR/aichan-ufw" << 'WRAPPER_EOF'
+#!/usr/bin/env bash
+# aichan-ufw — ufw 安全包装脚本
+# 允许：status/allow/limit/delete/reload/enable
+# 禁止：reset/default（防止破坏基础策略）
+set -euo pipefail
+
+ALLOWED_CMDS=("status" "allow" "limit" "delete" "reload" "enable" "disable" "show")
+BLOCKED_CMDS=("reset" "default")
+
+if [[ $# -lt 1 ]]; then
+    echo "用法：sudo aichan-ufw <ufw参数...>" >&2
+    exit 1
+fi
+
+# 提取第一个非选项参数作为子命令
+CMD=""
+for arg in "$@"; do
+    if [[ "$arg" != -* ]]; then
+        CMD="$arg"
+        break
+    fi
+done
+
+# 检查是否为禁止命令
+for blocked in "${BLOCKED_CMDS[@]}"; do
+    if [[ "$CMD" == "$blocked" ]]; then
+        echo "[aichan-ufw] 拒绝：禁止执行 ufw $CMD（危险操作，请联系主人）" >&2
+        exit 1
+    fi
+done
+
+# 检查是否在允许列表
+allowed=false
+for ok in "${ALLOWED_CMDS[@]}"; do
+    if [[ "$CMD" == "$ok" ]]; then
+        allowed=true
+        break
+    fi
+done
+
+if ! $allowed; then
+    echo "[aichan-ufw] 拒绝：不支持的子命令: $CMD" >&2
+    echo "[aichan-ufw] 允许的子命令：${ALLOWED_CMDS[*]}" >&2
+    exit 1
+fi
+
+exec /usr/sbin/ufw "$@"
+WRAPPER_EOF
+
 chmod +x "$WRAPPER_DIR/aichan-sync" \
          "$WRAPPER_DIR/aichan-write" \
          "$WRAPPER_DIR/aichan-cp" \
@@ -502,7 +553,8 @@ chmod +x "$WRAPPER_DIR/aichan-sync" \
          "$WRAPPER_DIR/aichan-chown" \
          "$WRAPPER_DIR/aichan-mv" \
          "$WRAPPER_DIR/aichan-rm" \
-         "$WRAPPER_DIR/aichan-systemctl"
+         "$WRAPPER_DIR/aichan-systemctl" \
+         "$WRAPPER_DIR/aichan-ufw"
 
 success "包装脚本部署完成"
 
@@ -604,6 +656,10 @@ aichan ALL=(root) NOPASSWD: /usr/bin/docker compose *
 aichan ALL=(root) NOPASSWD: $WRAPPER_DIR/aichan-systemctl
 aichan ALL=(root) NOPASSWD: $WRAPPER_DIR/aichan-systemctl *
 
+# ufw 防火墙管理（通过白名单包装脚本，禁止 reset/default）
+aichan ALL=(root) NOPASSWD: $WRAPPER_DIR/aichan-ufw
+aichan ALL=(root) NOPASSWD: $WRAPPER_DIR/aichan-ufw *
+
 # 软件包管理
 aichan ALL=(root) NOPASSWD: /usr/bin/apt install
 aichan ALL=(root) NOPASSWD: /usr/bin/apt install *
@@ -634,6 +690,47 @@ if [[ -f "$SUDOERS_FILE" ]]; then
     # 验证 sudoers 语法
     /usr/sbin/visudo -cf "$SUDOERS_FILE" || error "sudoers 语法错误，已中止"
     success "sudoers 配置完成"
+fi
+
+# ── 配置 ufw（L3/L4 自动执行） ────────────────────────────────────────────────
+AICHAN_IP="15.235.184.76"
+SSH_PORT="${SSH_PORT:-22}"
+# 检测实际 SSH 端口
+ACTUAL_SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | cut -d: -f2 | head -1)
+[[ -n "$ACTUAL_SSH_PORT" ]] && SSH_PORT="$ACTUAL_SSH_PORT"
+
+if [[ "$LEVEL" == "L3" || "$LEVEL" == "L4" ]]; then
+    if command -v ufw &>/dev/null; then
+        info "配置 ufw 防火墙规则..."
+
+        # 检查 ufw 是否已启用
+        UFW_STATUS=$(ufw status | head -1)
+        if echo "$UFW_STATUS" | grep -q "inactive"; then
+            info "ufw 未启用，初始化规则..."
+            ufw --force reset
+            ufw default deny incoming
+            ufw default allow outgoing
+        fi
+
+        # 爱衣 IP 对 SSH 端口 allow（优先于 limit）
+        ufw allow from "$AICHAN_IP" to any port "$SSH_PORT" comment 'aichan operator SSH'
+        # 其他人 limit
+        ufw limit "$SSH_PORT"/tcp comment 'SSH rate limit'
+
+        # 启用 ufw（已启用则 reload）
+        if echo "$UFW_STATUS" | grep -q "inactive"; then
+            ufw --force enable
+            success "ufw 已启用"
+        else
+            ufw reload
+            success "ufw 规则已更新"
+        fi
+
+        info "当前 ufw 规则："
+        ufw status verbose
+    else
+        warn "ufw 未安装，跳过防火墙配置"
+    fi
 fi
 
 # ── 完成 ──────────────────────────────────────────────────────────────────────
