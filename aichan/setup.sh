@@ -694,40 +694,17 @@ fi
 
 # ── 配置 ufw（L3/L4 自动执行） ────────────────────────────────────────────────
 AICHAN_IP="15.235.184.76"
-SSH_PORT="${SSH_PORT:-22}"
-# 检测实际 SSH 端口
-ACTUAL_SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | cut -d: -f2 | head -1)
-[[ -n "$ACTUAL_SSH_PORT" ]] && SSH_PORT="$ACTUAL_SSH_PORT"
 
 if [[ "$LEVEL" == "L3" || "$LEVEL" == "L4" ]]; then
     if command -v ufw &>/dev/null; then
-        info "配置 ufw 防火墙规则..."
-
-        # 检查 ufw 是否已启用
-        UFW_STATUS=$(ufw status | head -1)
-        if echo "$UFW_STATUS" | grep -q "inactive"; then
-            info "ufw 未启用，初始化规则..."
-            ufw --force reset
-            ufw default deny incoming
-            ufw default allow outgoing
-        fi
-
-        # 爱衣 IP 对 SSH 端口 allow（优先于 limit）
-        ufw allow from "$AICHAN_IP" to any port "$SSH_PORT" comment 'aichan operator SSH'
-        # 其他人 limit
-        ufw limit "$SSH_PORT"/tcp comment 'SSH rate limit'
-
-        # 启用 ufw（已启用则 reload）
-        if echo "$UFW_STATUS" | grep -q "inactive"; then
-            ufw --force enable
-            success "ufw 已启用"
+        info "检查 ufw 白名单..."
+        # 只检查爱衣 IP 是否已放行，不在则加入，其他规则一律不动
+        if ufw status | grep -q "$AICHAN_IP"; then
+            info "爱衣 IP $AICHAN_IP 已在白名单，跳过"
         else
-            ufw reload
-            success "ufw 规则已更新"
+            ufw allow from "$AICHAN_IP" comment 'aichan operator'
+            success "已将 $AICHAN_IP 加入 ufw 白名单"
         fi
-
-        info "当前 ufw 规则："
-        ufw status verbose
     else
         warn "ufw 未安装，跳过防火墙配置"
     fi
